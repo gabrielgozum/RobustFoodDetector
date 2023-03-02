@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--model_dir", type=str, help="Directory for saving models.", default=model_dir_default)
     parser.add_argument("--model_filename", type=str, help="Model filename.", default=model_filename_default)
     parser.add_argument("--resume", action="store_true", help="Resume training from saved checkpoint.")
+    parser.add_argument("--score", type=str, default="None", help="What type of energy score to use")
     argv = parser.parse_args()
 
     local_rank = argv.local_rank
@@ -68,6 +69,11 @@ def main():
     random_seed = argv.random_seed
     model_dir = argv.model_dir
     model_filename = argv.model_filename
+    if (argv.score == "OE"):
+        model_filename = model_filename.rsplit('.')[0] + "_OE.pth"
+    elif (argv.score == "energy"):
+        model_filename = model_filename.rsplit('.')[0] + "_energy.pth"
+
     resume = argv.resume
 
     # Create directories outside the PyTorch program
@@ -152,6 +158,15 @@ def main():
             optimizer.zero_grad()
             outputs = ddp_model(inputs)
             loss = criterion(outputs, labels)
+
+            # https://github.com/wetliu/energy_ood/blob/master/CIFAR/train.py
+            if argv.score == 'energy':
+                Ec_out = -torch.logsumexp(outputs[len(inputs[0]):], dim=1)
+                Ec_in = -torch.logsumexp(outputs[:len(inputs[0])], dim=1)
+                loss += 0.1*(torch.pow(F.relu(Ec_in-(-25)), 2).mean() + torch.pow(F.relu((-7)-Ec_out), 2).mean())
+            elif argv.score == 'OE':
+                loss += 0.5 * -(outputs[len(inputs[0]):].mean(1) - torch.logsumexp(outputs[len(inputs[0]):], dim=1)).mean()
+
             loss.backward()
             optimizer.step()
 
