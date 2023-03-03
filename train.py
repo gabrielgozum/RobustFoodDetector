@@ -3,6 +3,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 import torchvision
 import torchvision.transforms as transforms
@@ -22,21 +23,29 @@ def set_random_seeds(random_seed=0):
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-def evaluate(model, device, test_loader):
+def evaluate(model, device, test_loader, epoch, criterion, writer):
 
     model.eval()
 
     correct = 0
     total = 0
+    avg_loss_test = 0
     with torch.no_grad():
         for data in test_loader:
             images, labels = data[0].to(device), data[1].to(device)
             outputs = model(images)
             _, predicted = torch.max(outputs.data, 1)
+            loss = criterion(outputs, labels)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            avg_loss_test += loss
 
+    avg_loss_test /= len(test_loader.sampler)
     accuracy = correct / total
+
+    if writer:
+        writer.add_scalar("Loss/test", avg_loss_test, epoch)
+        writer.add_scalar("Accuracy/test", accuracy, epoch)
 
     return accuracy
 
@@ -60,6 +69,7 @@ def main():
     parser.add_argument("--model_filename", type=str, help="Model filename.", default=model_filename_default)
     parser.add_argument("--resume", action="store_true", help="Resume training from saved checkpoint.")
     parser.add_argument("--score", type=str, default="None", help="What type of energy score to use")
+    parser.add_argument("--eval", action="store_true", help="Run eval on the model")
     argv = parser.parse_args()
 
     local_rank = argv.local_rank
@@ -137,15 +147,23 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(ddp_model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-5)
 
+    writer = SummaryWriter()
+
+    if argv.eval:
+        accuracy = evaluate(model=ddp_model, device=device, test_loader=test_loader, epoch=0, criterion=criterion, writer=None)
+        print("Accuracy on test data: {}".format(accuracy))
+        exit()
+
     # Loop over the dataset multiple times
     for epoch in range(num_epochs):
 
         print("Local Rank: {}, Epoch: {}, Training ...".format(local_rank, epoch))
+        avg_loss_train = 0
         
         # Save and evaluate model routinely
         if epoch % 10 == 0:
             if local_rank == 0:
-                accuracy = evaluate(model=ddp_model, device=device, test_loader=test_loader)
+                accuracy = evaluate(model=ddp_model, device=device, test_loader=test_loader, epoch=epoch, criterion=criterion, writer=writer)
                 torch.save(ddp_model.state_dict(), model_filepath)
                 print("-" * 75)
                 print("Epoch: {}, Accuracy: {}".format(epoch, accuracy))
@@ -159,16 +177,21 @@ def main():
             outputs = ddp_model(inputs)
             loss = criterion(outputs, labels)
 
+
             # https://github.com/wetliu/energy_ood/blob/master/CIFAR/train.py
-            if argv.score == 'energy':
+            if argv.score == "energy":
                 Ec_out = -torch.logsumexp(outputs[len(inputs[0]):], dim=1)
                 Ec_in = -torch.logsumexp(outputs[:len(inputs[0])], dim=1)
-                loss += 0.1*(torch.pow(F.relu(Ec_in-(-25)), 2).mean() + torch.pow(F.relu((-7)-Ec_out), 2).mean())
-            elif argv.score == 'OE':
+                loss += 0.1*(torch.pow(nn.functional.relu(Ec_in-(-25)), 2).mean() + torch.pow(nn.functional.relu((-7)-Ec_out), 2).mean())
+            elif argv.score == "OE":
                 loss += 0.5 * -(outputs[len(inputs[0]):].mean(1) - torch.logsumexp(outputs[len(inputs[0]):], dim=1)).mean()
 
+            avg_loss_train += loss
             loss.backward()
             optimizer.step()
+        avg_loss_train /= len(train_loader.sampler)
+        writer.add_scalar("Loss/train", avg_loss_train, epoch)
+    writer.close()
 
 if __name__ == "__main__":
     
